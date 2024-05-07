@@ -28,24 +28,26 @@ from utils import (
 )
 import random
 from SDS import SDS, CLIP
+from torch.cuda.amp import GradScaler, autocast
 import torchvision.transforms as T
 from differentiable_object import DifferentiableObject
 from pytorch3d.structures import (
-    join_meshes_as_batch, 
+    join_meshes_as_batch,
     join_meshes_as_scene
 )
 
+
 def optimize_mesh_texture(
-    sds: SDS,
-    clip: CLIP,
-    mesh_paths,
-    output_dir,
-    prompt,
-    neg_prompt="",
-    device="cpu",
-    log_interval=100,
-    save_mesh=True,
-    args=None,
+        sds: SDS,
+        clip: CLIP,
+        mesh_paths,
+        output_dir,
+        prompt,
+        neg_prompt="",
+        device="cpu",
+        log_interval=100,
+        save_mesh=True,
+        args=None,
 ):
     """
     Optimize the texture map of a mesh to match the prompt.
@@ -54,10 +56,10 @@ def optimize_mesh_texture(
     sds_embeddings = prepare_embeddings(sds, prompt, neg_prompt) if args.use_sds else None
     clip_embeddings = prepare_clip_embeddings(clip, prompt, neg_prompt) if args.use_clip else None
     # sds.text_encoder.to("cpu")  # free up GPU memory
-    # torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
 
     # Step 3.1 Initialize the renderer
-    renderer = get_mesh_renderer_soft(image_size=512, device=device)
+    renderer = get_mesh_renderer_soft(image_size=128, device=device)
     renderer.shader.lights = pytorch3d.renderer.PointLights(location=[[0, 0, -3]], device=device)
 
     # Step 2. Load the mesh
@@ -68,21 +70,21 @@ def optimize_mesh_texture(
         mesh = normalize_mesh_longest_axis(mesh, rotation_degrees=mesh_init_orientation)
         mesh_list.append(mesh.to(device))
 
-
     for i in range(len(mesh_list)):
-        mesh_list[i] = clone_mesh(mesh_list[i], shift=args.mesh_configs[i]["transition"], scale=args.mesh_configs[i]["scale"])
+        mesh_list[i] = clone_mesh(mesh_list[i], shift=args.mesh_configs[i]["transition"],
+                                  scale=args.mesh_configs[i]["scale"])
 
     if args.use_rand_init:
-        mesh_list = random_mesh_initiailization_queue(args, mesh_list, renderer, clip, clip_embeddings["default"], rand_scale=0.3)
+        mesh_list = random_mesh_initiailization_queue(args, mesh_list, renderer, clip, clip_embeddings["default"],
+                                                      rand_scale=0.3)
 
-    # Step 2.1 Initialize a randome texture map (optimizable parameter)
+    # Step 2.1 Initialize a random texture map (optimizable parameter)
     # create a texture field with implicit function
     mesh = join_meshes_as_batch(mesh_list)
 
     diff_objects = DifferentiableObject(mesh, device)
 
     mesh = join_meshes_as_scene(diff_objects())
-
 
     # For logging purpose, render 360 views of the initial mesh
     if save_mesh:
@@ -97,7 +99,6 @@ def optimize_mesh_texture(
             output_path=osp.join(output_dir, "initial_mesh.gif"),
         )
         save_mesh_as_ply(mesh.detach(), osp.join(output_dir, f"initial_mesh.ply"))
-
 
     # generate rendering viewpoints
     Rs = []
@@ -115,7 +116,6 @@ def optimize_mesh_texture(
     R, T = look_at_view_transform(dist=args.dist, elev=0, azim=np.linspace(-180, 180, 12, endpoint=False))
     testing_cameras = FoVPerspectiveCameras(R=R, T=T, device=mesh.device)
 
-
     # Step 4. Create optimizer training parameters
     parameters = [
         {'params': [diff_objects.scale], 'lr': 1e-3, "name": "scale"},
@@ -123,9 +123,10 @@ def optimize_mesh_texture(
         {'params': [diff_objects.transition], 'lr': 1e-2, "name": "transition"},
     ]
     optimizer = torch.optim.AdamW(parameters, lr=1e-4, weight_decay=0)
-    total_iter = 20000
+    # total_iter = 20000
+    total_iter = 2
     scheduler = get_cosine_schedule_with_warmup(optimizer, 100, int(total_iter * 1.5))
-    
+
     # Step 5. Training loop to optimize the mesh positions
     loss_dict = {}
     for i in tqdm(range(total_iter)):
@@ -138,7 +139,9 @@ def optimize_mesh_texture(
         # Forward pass
         # Render a randomly sampled camera view to optimize in this iteration
         sampled_cameras = query_cameras[random.choices(range(len(query_cameras)), k=args.views_per_iter)]
-        rend = torch.permute(renderer(join_meshes_as_batch([mesh]*args.views_per_iter), cameras=sampled_cameras)[..., :3], (0, 3, 1, 2))
+        rend = torch.permute(
+            renderer(join_meshes_as_batch([mesh] * args.views_per_iter), cameras=sampled_cameras)[..., :3],
+            (0, 3, 1, 2))
         loss = 0.
         if args.use_sds:
             latents = sds.encode_imgs(rend)
@@ -149,13 +152,17 @@ def optimize_mesh_texture(
 
         print(f"Iter {i}, Loss: {loss.item()}")
 
-
         # Backward pass
         loss.backward()
         torch.nn.utils.clip_grad_norm_([parameter['params'][0] for parameter in parameters], max_norm=1.0)
         optimizer.step()
         scheduler.step()
 
+        # Backward pass
+        # loss.backward()
+        # torch.nn.utils.clip_grad_norm_([parameter['params'][0] for parameter in parameters], max_norm=1.0)
+        # optimizer.step()
+        # scheduler.step()
 
         # clamping the latents to avoid over saturation
         if i % log_interval == 0 or i == total_iter - 1:
@@ -199,9 +206,8 @@ def optimize_mesh_texture(
                     loss -= clip.clip_loss(rend, clip_embeddings["default"])
                     # loss += clip.clip_loss(rend, clip_embeddings["default"])
 
-            diff_objects.write_log_to_file(log_path, log=f"Iter {i}, Score: {loss.item()/len(testing_cameras)}")
-            print(f"Iter {i}, Score: {loss.item()/len(testing_cameras)}")
-            
+            diff_objects.write_log_to_file(log_path, log=f"Iter {i}, Score: {loss.item() / len(testing_cameras)}")
+            print(f"Iter {i}, Score: {loss.item() / len(testing_cameras)}")
 
     if save_mesh:
         render_360_views(
@@ -217,7 +223,7 @@ def optimize_mesh_texture(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt", type=str, default="A chair and a table with a toy dinosaur on it")
-    parser.add_argument("--seed", type=int, default=42) # 42
+    parser.add_argument("--seed", type=int, default=42)  # 42
     parser.add_argument("--output_dir", type=str, default="output")
     parser.add_argument(
         "--postfix",
@@ -242,22 +248,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--views_per_iter",
         type=int,
-        default=3    # viewpoints sampled from calculated the loss in a single iteration
+        default=1  # viewpoints sampled from calculated the loss in a single iteration
     )
     parser.add_argument(
         "--use_sds",
         type=int,
-        default=0    # use SDS loss when != 0
+        default=0  # use SDS loss when != 0
     )
     parser.add_argument(
         "--use_clip",
         type=int,
-        default=1    # use CLIP loss when != 0
+        default=1  # use CLIP loss when != 0
     )
     parser.add_argument(
         "--use_rand_init",
         type=int,
-        default=0    # use sampling-base initialization for the initial positions of meshes
+        default=0  # use sampling-base initialization for the initial positions of meshes
     )
     args = parser.parse_args()
 
@@ -273,21 +279,21 @@ if __name__ == "__main__":
     # manually adjustthe initial positions of meshes (could use the suggestion from LLM instead)
 
     args.mesh_configs = [{
-                    "transition": (-1,0,0), 
-                    "rotation": (0,0,0), 
-                    "scale": 1  # chair
-                },
-                {
-                    "transition": (0,0,0), 
-                    "rotation": (0,0,0), 
-                    "scale": 1  # table
-                },
-                {
-                    "transition": (0,1,0), 
-                    "rotation": (0,0,0), 
-                    "scale": 0.5  # dinosaur
-                }]
-    
+        "transition": (-1, 0, 0),
+        "rotation": (0, 0, 0),
+        "scale": 1  # chair
+    },
+        {
+            "transition": (0, 0, 0),
+            "rotation": (0, 0, 0),
+            "scale": 1  # table
+        },
+        {
+            "transition": (0, 1, 0),
+            "rotation": (0, 0, 0),
+            "scale": 0.5  # dinosaur
+        }]
+
     ##########################
 
     seed_everything(args.seed)
@@ -295,7 +301,8 @@ if __name__ == "__main__":
     # create output directory
     args.output_dir = osp.join(args.output_dir, "mesh")
     output_dir = os.path.join(
-        args.output_dir, args.prompt.replace(" ", "_") + args.postfix + ("_sds" if args.use_sds else "") + ("_clip" if args.use_clip else "") + f"_{args.views_per_iter}view"
+        args.output_dir, args.prompt.replace(" ", "_") + args.postfix + ("_sds" if args.use_sds else "") + (
+            "_clip" if args.use_clip else "") + f"_{args.views_per_iter}view"
     )
     os.makedirs(output_dir, exist_ok=True)
 
@@ -307,12 +314,13 @@ if __name__ == "__main__":
     # optimize the texture map of a mesh
     start_time = time.time()
     assert (
-        args.mesh_paths is not None
+            args.mesh_paths is not None
     ), "mesh_path should be provided for optimizing the texture map for a mesh"
-    
-    neg_prompt = [""] # ["", "distortion", "blur"]
-    
+
+    neg_prompt = [""]  # ["", "distortion", "blur"]
+
     optimize_mesh_texture(
-        sds, clip, mesh_paths=args.mesh_paths, output_dir=output_dir, prompt=args.prompt, neg_prompt=neg_prompt, device=device, args=args
+        sds, clip, mesh_paths=args.mesh_paths, output_dir=output_dir, prompt=args.prompt, neg_prompt=neg_prompt,
+        device=device, args=args
     )
     print(f"Optimization took {time.time() - start_time:.2f} seconds")
